@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn region_get_set() {
-        let mut region_ptr = Region::new(IVec3::new(0, -60, 0), IVec3::new(512, 324, 512));
+        let mut region_ptr = Region::new(IVec3::new(0, -64, 0), IVec3::new(512, 320, 512));
         let region = unsafe { region_ptr.as_mut() };
         let mut rng = TestRng::new(0x39567387819381);
 
@@ -412,7 +412,7 @@ mod tests {
         for _ in 0..4096 {
             let pt = IVec3 {
                 x: (rng.next() & 511) as i32,
-                y: (rng.next() % 384) as i32 - 60,
+                y: (rng.next() % 384) as i32 - 64,
                 z: (rng.next() & 511) as i32,
             };
             let val = Voxel((rng.next() & 127) as u16);
@@ -424,7 +424,7 @@ mod tests {
         for _ in 0..4096 {
             let pt = IVec3 {
                 x: (rng.next() & 511) as i32,
-                y: (rng.next() % 384) as i32 - 60,
+                y: (rng.next() % 384) as i32 - 64,
                 z: (rng.next() & 511) as i32,
             };
             let val = Light { intensity: (rng.next() & 255) as u8, hsl_color: 0 };
@@ -436,7 +436,7 @@ mod tests {
         for _ in 0..4096 {
             let pt = IVec3 {
                 x: (rng.next() & 511) as i32,
-                y: (rng.next() % 384) as i32 - 60,
+                y: (rng.next() % 384) as i32 - 64,
                 z: (rng.next() & 511) as i32,
             };
 
@@ -464,7 +464,7 @@ mod tests {
         for i in 0..16 {
             let pt = IVec3 {
                 x: (rng.next() & 511) as i32 + 512,
-                y: (rng.next() % 384) as i32 - 60,
+                y: (rng.next() % 384) as i32 - 64,
                 z: (rng.next() & 511) as i32,
             };
             assert_eq!(region.get_voxel(pt), None);
@@ -475,7 +475,7 @@ mod tests {
         for i in 0..16 {
             let pt = IVec3 {
                 x: (rng.next() & 511) as i32,
-                y: (rng.next() % 384) as i32 - 60,
+                y: (rng.next() % 384) as i32 - 64,
                 z: (rng.next() & 511) as i32 + 512,
             };
             assert_eq!(region.get_voxel(pt), None);

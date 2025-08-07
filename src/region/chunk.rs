@@ -80,33 +80,37 @@ impl Chunk {
     }
 
     pub fn get_voxel(&self, pos: IVec3) -> Option<Voxel> {
-        let oy = (pos.y - self.min.y) >> SUBCHUNK_WIDTH_SHF;
+        let y = pos.y - self.min.y;
+        let oy = y >> SUBCHUNK_WIDTH_SHF;
         (oy >= 0 && oy < self.len as i32).then(|| {
-            let j = super::to_voxel_index_wrapping(pos);
+            let j = super::to_voxel_index_wrapping(pos.with_y(y));
             Voxel(unsafe { self.palettes.add((oy as usize) << CHUNKS_PER_REGION_SHF).as_ref().get(j) })
         })
     }
 
     pub fn set_voxel(&mut self, pos: IVec3, voxel: Voxel) -> Option<Voxel> {
-        let oy = (pos.y - self.min.y) >> SUBCHUNK_WIDTH_SHF;
+        let y = pos.y - self.min.y;
+        let oy = y >> SUBCHUNK_WIDTH_SHF;
         (oy >= 0 && oy < self.len as i32).then(|| {
-            let j = super::to_voxel_index_wrapping(pos);
+            let j = super::to_voxel_index_wrapping(pos.with_y(y));
             Voxel(unsafe { self.palettes.add((oy as usize) << CHUNKS_PER_REGION_SHF).as_mut().replace(j, voxel.0) })
         })
     }
 
     pub fn get_light(&self, pos: IVec3) -> Option<Light> {
-        let oy = (pos.y - self.min.y) >> SUBCHUNK_WIDTH_SHF;
+        let y = pos.y - self.min.y;
+        let oy = y >> SUBCHUNK_WIDTH_SHF;
         (oy >= 0 && oy < self.len as i32).then(|| {
-            let j = super::to_voxel_index_wrapping(pos);
+            let j = super::to_voxel_index_wrapping(pos.with_y(y));
             unsafe { self.lightmaps.add((oy as usize) << CHUNKS_PER_REGION_SHF).as_ref().get_unchecked(j) }
         })
     }
 
     pub fn set_light(&mut self, pos: IVec3, light: Light) -> Option<Light> {
-        let oy = (pos.y - self.min.y) >> SUBCHUNK_WIDTH_SHF;
+        let y = pos.y - self.min.y;
+        let oy = y >> SUBCHUNK_WIDTH_SHF;
         (oy >= 0 && oy < self.len as i32).then(|| {
-            let j = super::to_voxel_index_wrapping(pos);
+            let j = super::to_voxel_index_wrapping(pos.with_y(y));
             unsafe { self.lightmaps.add((oy as usize) << CHUNKS_PER_REGION_SHF).as_mut().set_unchecked(j, light) }
         })
     }
@@ -146,14 +150,16 @@ impl<'s> Subchunk<'s> {
     /// This operation is wrapping, out-of-bounds points will wrap to the other side of the subchunk.
     /// This is faster because there are no bounds checks, but can cause issues if not considered.
     pub fn get_voxel(&self, pos: IVec3) -> Voxel {
-        let j = super::to_voxel_index_wrapping(pos);
+        let y = pos.y - self.region.min().y;
+        let j = super::to_voxel_index_wrapping(pos.with_y(y));
         Voxel(unsafe { self.region.palettes.add(self.index).as_ref().get(j) })
     }
 
     /// This operation is wrapping, out-of-bounds points will wrap to the other side of the subchunk.
     /// This is faster because there are no bounds checks, but can cause issues if not considered.
     pub fn get_light(&self, pos: IVec3) -> Light {
-        let j = super::to_voxel_index_wrapping(pos);
+        let y = pos.y - self.region.min().y;
+        let j = super::to_voxel_index_wrapping(pos.with_y(y));
         unsafe { self.region.lightmaps.add(self.index).as_ref().get_unchecked(j) }
     }
 }
@@ -174,22 +180,26 @@ pub struct SubchunkMut<'s> {
 
 impl<'s> SubchunkMut<'s> {
     pub fn get_voxel(&self, pos: IVec3) -> Voxel {
-        let j = super::to_voxel_index_wrapping(pos);
+        let y = pos.y - self.region.min().y;
+        let j = super::to_voxel_index_wrapping(pos.with_y(y));
         Voxel(unsafe { self.region.palettes.add(self.index).as_ref().get(j) })
     }
 
     pub fn set_voxel(&mut self, pos: IVec3, voxel: Voxel) -> Voxel {
-        let j = super::to_voxel_index_wrapping(pos);
+        let y = pos.y - self.region.min().y;
+        let j = super::to_voxel_index_wrapping(pos.with_y(y));
         Voxel(unsafe { self.region.palettes.add(self.index).as_mut().replace(j, voxel.0) })
     }
 
     pub fn get_light(&self, pos: IVec3) -> Light {
-        let j = super::to_voxel_index_wrapping(pos);
+        let y = pos.y - self.region.min().y;
+        let j = super::to_voxel_index_wrapping(pos.with_y(y));
         unsafe { self.region.lightmaps.add(self.index).as_ref().get_unchecked(j) }
     }
 
     pub fn set_light(&mut self, pos: IVec3, light: Light) -> Light {
-        let j = super::to_voxel_index_wrapping(pos);
+        let y = pos.y - self.region.min().y;
+        let j = super::to_voxel_index_wrapping(pos.with_y(y));
         unsafe { self.region.lightmaps.add(self.index).as_mut().set_unchecked(j, light) }
     }
 }

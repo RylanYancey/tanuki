@@ -8,6 +8,8 @@ mod reader;
 pub use reader::VoxelReader;
 mod writer;
 pub use writer::VoxelWriter;
+mod worm;
+pub use worm::{VoxelDir, Worm, WormMut};
 
 pub trait VoxelRead {
     /// Used because our writers often need multiple mutable references to different 

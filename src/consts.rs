@@ -2,6 +2,7 @@
 pub const SUBCHUNK_WIDTH: usize = 32;
 pub const SUBCHUNK_LENGTH: usize = 32768;
 pub const SUBCHUNK_WIDTH_SHF: usize = 5;
+pub const SUBCHUNK_WIDTH_WRAP: usize = (1 << SUBCHUNK_WIDTH_SHF) - 1;
 pub const CHUNKS_PER_REGION: usize = 256;
 pub const CHUNKS_PER_REGION_SHF: usize = 16;
 pub const REGION_WIDTH: usize = 512;

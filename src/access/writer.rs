@@ -37,8 +37,8 @@ mod tests {
     fn writer_get_set() {
         let mut world = VoxelWorld::new(
             VoxelConfig {
-                max_y: 324,
-                min_y: -60,
+                max_y: 320,
+                min_y: -64,
             }
         );
 
@@ -53,7 +53,7 @@ mod tests {
             let pt = IVec3 {
                 x: (rng.next() & 1023) as i32 - 512,
                 z: (rng.next() & 1023) as i32 - 512,
-                y: (rng.next() % 384) as i32 - 60,
+                y: (rng.next() % 384) as i32 - 64,
             };
             let v = Voxel((rng.next() & 127) as u16);
 
