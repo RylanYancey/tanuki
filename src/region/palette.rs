@@ -56,11 +56,11 @@ impl<A: Allocator> PaletteArray<A> {
                 ptr.write(0); // first element of the palette is always 0
                 ptr
             };
-
+            
             let words = unsafe {
                 let layout = Layout::array::<usize>(bpi.words_len as usize).unwrap();
                 let ptr = alloc.allocate(layout).unwrap().as_non_null_ptr().cast::<usize>();
-                ptr.write_bytes(0, bpi.words_len as usize * mem::size_of::<usize>());
+                ptr.write_bytes(0, bpi.words_len as usize);
                 ptr
             };
 

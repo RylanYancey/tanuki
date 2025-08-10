@@ -9,3 +9,10 @@ bevy_math = "^0.16.1"
 bitvec = "1.0.1"
 generational-arena = "0.2.9"
 parking_lot = "0.12.4"
+
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bench]]
+name = "palette"
+harness = false

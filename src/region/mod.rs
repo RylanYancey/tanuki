@@ -17,6 +17,8 @@ pub use alloc::Alloc;
 mod voxel;
 pub use voxel::{Voxel, VoxelData};
 
+mod palette2;
+
 /// A Region is a 512xHx512 volume of voxels where H is a multiple of 32.
 /// Regions can be thought of EITHER as a 3d array of Subchunks, or a 2D array of [`Chunk`]s.
 /// 
