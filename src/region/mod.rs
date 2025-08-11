@@ -17,7 +17,6 @@ pub use alloc::Alloc;
 mod voxel;
 pub use voxel::{Voxel, VoxelData};
 
-mod palette2;
 
 /// A Region is a 512xHx512 volume of voxels where H is a multiple of 32.
 /// Regions can be thought of EITHER as a 3d array of Subchunks, or a 2D array of [`Chunk`]s.
@@ -191,7 +190,7 @@ impl Region {
         let offs = pos - self.shape.min;
         let i = to_subchunk_index(offs);
         let j = to_voxel_index_wrapping(offs);
-        Voxel(unsafe { self.palettes.add(i).as_mut().replace(j, voxel.0) })
+        Voxel(unsafe { self.palettes.add(i).as_mut().set(j, voxel.0) })
     }
 
     pub fn set_voxel(&mut self, pos: IVec3, voxel: Voxel) -> Option<Voxel> {
@@ -199,7 +198,7 @@ impl Region {
         (((offs.x | offs.y | offs.z) as u32) < 512 && offs.y < self.shape.height).then(|| {
             let i = to_subchunk_index(offs);
             let j = to_voxel_index_wrapping(offs);
-            Voxel(unsafe { self.palettes.add(i).as_mut().replace(j, voxel.0) })
+            Voxel(unsafe { self.palettes.add(i).as_mut().set(j, voxel.0) })
         })
     }
 
@@ -263,7 +262,7 @@ impl Region {
         let j = to_voxel_index_wrapping(offs);
         VoxelData {
             light: unsafe { self.lightmaps.add(i).as_mut().set_unchecked(j, data.light) },
-            state: Voxel(unsafe { self.palettes.add(i).as_mut().replace(j, data.state.0) })
+            state: Voxel(unsafe { self.palettes.add(i).as_mut().set(j, data.state.0) })
         }
     }
 
@@ -274,7 +273,7 @@ impl Region {
             let j = to_voxel_index_wrapping(offs);
             VoxelData {
                 light: unsafe { self.lightmaps.add(i).as_mut().set_unchecked(j, data.light) },
-                state: Voxel(unsafe { self.palettes.add(i).as_mut().replace(j, data.state.0) })
+                state: Voxel(unsafe { self.palettes.add(i).as_mut().set(j, data.state.0) })
             }
         })
     }

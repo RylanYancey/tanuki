@@ -1,41 +1,78 @@
-use std::alloc::{Allocator, Global, Layout};
-use std::cmp::Ordering;
-use std::simd::cmp::SimdPartialEq;
-use std::simd::prelude::*;
-use std::{hint, mem};
-use std::ptr::NonNull;
+use std::{alloc::{Allocator, Global, Layout}, cell::{OnceCell, RefCell}, ptr::NonNull, simd::prelude::*, time::Duration};
 
-use crate::consts::{SIMD_LANES, SUBCHUNK_LENGTH};
+use web_time::{SystemTime, UNIX_EPOCH};
+
+use crate::consts::*;
 
 static mut BPI_ZERO_WORD: usize = 0;
 static mut BPI_ZERO_PALETTE: u16 = 0;
+static mut EMPTY_CACHE: [(u16, u16); 16] = [(u16::MAX, u16::MAX); 16];
 
-pub struct PaletteArray<A: Allocator = Global> {
+pub struct PaletteArray<A: Allocator=Global> {
+    /// Storage for indices of voxel states in the palette.
+    /// These indices are "packed" according to the bpi, to 
+    /// access them we must extract with a series of bitops.
     words: NonNull<usize>,
+
+    /// Set of all Voxel states represented in this array.
+    /// The order of the palette must never change, becuase a change 
+    /// would invalidate any indices that point to that element.
+    /// The first entry in the palette is always 0. 
     palette: NonNull<u16>,
-    cache: NonNull<Cache>,
-    bpi: &'static Bpi,
     palette_len: u32,
     palette_cap: u32,
+
+    /// Hashmap of Voxel states for fast lookup.
+    /// The items in cache are voxel keys to palette indices.
+    /// "cache_bits" is the available capacity minus 1. 
+    /// "cache_size" is the number of items present. 
+    /// A palette index of u16::MAX indicates an unused slot.
+    /// "threshold" is the max number of items before the map is grown.
+    /// "random" is used to prevent DoS attacks.
+    /// Linear Probing is used to search the map. Find more info here:
+    /// https://en.wikipedia.org/wiki/Linear_probing
+    cache: NonNull<(u16, u16)>,
+    cache_size: u16,
+    cache_bits: u16,
+    threshold: u16,
+    random: u16,
+
+    /// Parameters that aid in index extraction/assignment 
+    /// of indices. BPI is short for "bits-per-index". 
+    /// 
+    /// The BPI is based on the length of the Palette. 
+    /// For example, if the length of the palette is 256, 
+    /// the bpi is 8, because 8 bits are needed to store 
+    /// an index in the palette. 
+    bpi: &'static Bpi,
+
+    /// Allocator used for the pointers. Right now
+    /// this is the Global Allocator, but in the future
+    /// I want to make this a custom region allocator.
     alloc: A,
 }
 
 impl<A: Allocator> PaletteArray<A> {
-    /// Initialize a new PaletteArray where all voxels are 0. 
-    /// We're using statics here to set the pointers to because we
-    /// don't want to have to check if the palette is empty or not every access.
-    /// In order to mutate the voxels, we would have to push to cache, which would mean
-    /// growing the buffer. THATs where we allocate a pointer that can actually 
-    /// be mutated. 
+    /// Allocate a PaletteArray with a capacity of 1 (air only). 
+    /// 
+    /// We're using statics here instead of `Option<NonNull<T>>`, which allows our
+    /// .get()s to be branchless - this DID result in a significant performance improvement.
+    /// 
+    /// As long as we don't assign to the pointers before allocating, we're fine. 
+    /// (although we do assign once, but guaranteed to only be 0 so its fine)
     #[allow(static_mut_refs)]
-    pub const fn empty(alloc: A) -> Self {
+    pub fn empty(alloc: A) -> Self {
         unsafe {
             Self {
-                palette: NonNull::new_unchecked(&BPI_ZERO_PALETTE as *const u16 as *mut u16),
+                palette: NonNull::new_unchecked(&BPI_ZERO_PALETTE as *const _ as *mut _),
                 palette_len: 1,
-                palette_cap: 1,
-                words: NonNull::new_unchecked(&BPI_ZERO_WORD as *const usize as *mut usize),
-                cache: NonNull::new_unchecked(&Cache::EMPTY as *const _ as *mut _),
+                palette_cap: 1, 
+                words: NonNull::new_unchecked(&BPI_ZERO_WORD as *const _ as *mut _),
+                cache: NonNull::new_unchecked(&EMPTY_CACHE as *const _ as *mut _),
+                cache_size: 0,
+                cache_bits: 0b1111,
+                threshold: 11, 
+                random: init_random_state(),
                 bpi: &Bpi::BPI0,
                 alloc,
             }
@@ -57,16 +94,15 @@ impl<A: Allocator> PaletteArray<A> {
                 ptr
             };
             
-            let words = unsafe {
+            let words = {
                 let layout = Layout::array::<usize>(bpi.words_len as usize).unwrap();
-                let ptr = alloc.allocate(layout).unwrap().as_non_null_ptr().cast::<usize>();
-                ptr.write_bytes(0, bpi.words_len as usize);
+                let ptr = alloc.allocate_zeroed(layout).unwrap().as_non_null_ptr().cast::<usize>();
                 ptr
             };
 
             #[allow(static_mut_refs)]
             let cache = unsafe {
-                NonNull::new_unchecked(&Cache::EMPTY as *const _ as *mut _)
+                NonNull::new_unchecked(&EMPTY_CACHE as *const _ as *mut _)
             };
 
             Self {
@@ -75,96 +111,140 @@ impl<A: Allocator> PaletteArray<A> {
                 palette_cap: 1,
                 words,
                 cache,
+                cache_size: 0,
+                cache_bits: 0b1111,
+                threshold: 11,
+                random: init_random_state(),
                 bpi,
                 alloc
             }
         }
     }
 
-    fn cache_is_init(&self) -> bool {
-        unsafe { self.cache.as_ref().is_init } 
-    }
-
-    #[inline]
-    pub fn get(&self, idx: usize) -> u16 {
-        debug_assert!(idx < 32768);
+    /// Extract the voxel state at the index.
+    #[inline(always)]
+    pub unsafe fn get(&self, idx: usize) -> u16 {
+        debug_assert!(idx < 32768, "Index out of bounds: '{idx}'");
         unsafe {
-            let bpi = *self.bpi;
-            let offset = self.bpi.offsets.get_unchecked(idx & bpi.ipu_mod);
-            let word = *self.words.as_ptr().add(idx >> bpi.ipu_div);
-            let pal_idx = (word >> offset) & bpi.bpi_mask;
-            *self.palette.as_ptr().add(pal_idx)
+            let bpi = self.bpi;
+            let offs = bpi.offsets.get_unchecked(idx & bpi.ipu_mod);
+            let word = *self.words.add(idx >> bpi.ipu_div).as_ptr();
+            let pidx = (word >> offs) & bpi.bpi_mask;
+            *self.palette.add(pidx).as_ptr()
         }
     }
 
-    #[inline]
-    pub fn set(&mut self, idx: usize, val: u16) {
-        debug_assert!(idx < 32768);
+    /// Assign to the voxel state at this index, returning the previous value.
+    #[inline(always)]
+    pub unsafe fn set(&mut self, idx: usize, val: u16) -> u16 {
+        debug_assert!(idx < 32768, "Index out of bounds: '{idx}'");
         unsafe {
-            let pidx = self.search_cache(val);
-            let bpi = *self.bpi;
-            let offs = *self.bpi.offsets.get_unchecked(idx & bpi.ipu_mod);
-            let word = self.words.as_ptr().add(idx >> bpi.ipu_div);
-            *word = (*word & !(bpi.bpi_mask << offs)) | (pidx << offs);
-        }
-    }
-
-    #[inline]
-    pub fn replace(&mut self, idx: usize, val: u16) -> u16 {
-        debug_assert!(idx < 32768);
-        unsafe {
-            let pidx = self.search_cache(val);
-            let bpi = *self.bpi;
-            let offs = *self.bpi.offsets.get_unchecked(idx & bpi.ipu_mod);
-            let word = self.words.as_ptr().add(idx >> bpi.ipu_div);
+            let pidx = self.search(val);
+            let bpi = self.bpi;
+            let offs = bpi.offsets.get_unchecked(idx & bpi.ipu_mod);
+            let word = self.words.add(idx >> bpi.ipu_div).as_mut();
             let old = (*word >> offs) & bpi.bpi_mask;
             *word = (*word & !(bpi.bpi_mask << offs)) | (pidx << offs);
             *self.palette.add(old).as_ptr()
         }
     }
 
-    /// Modify a voxel and return the old value.
-    #[inline]
-    pub fn update<F>(&mut self, idx: usize, f: F) -> u16 
-    where
-        F: FnOnce(u16) -> u16,
-    {
+    #[inline(always)]
+    fn search(&mut self, key: u16) -> usize {
         unsafe {
-            let bpi = *self.bpi;
-            let offs = *self.bpi.offsets.get_unchecked(idx & bpi.ipu_mod);
-            let word = self.words.as_ptr().add(idx >> bpi.ipu_div);
-            let old_index = (*word >> offs) & bpi.bpi_mask;
-            let old_voxel = *self.palette.add(old_index).as_ptr();
-            let new = (f)(old_voxel);
-            if new != old_voxel {
-                let pidx = self.search_cache(new);
-                *word = (*word & !(bpi.bpi_mask << offs)) | (pidx << offs);
+            let mut index = ((key ^ self.random) & self.cache_bits) as usize;
+            loop {
+                let entry = *self.cache.add(index).as_ptr();
+
+                // An index of 65535 means the spot is unused.
+                if entry.1 == u16::MAX {
+                    // resolve key to an index in the palette and assign.
+                    let pidx = self.find_or_insert_in_palette(key);
+                    *self.cache.add(index).as_mut() = (key, pidx as u16);
+                    self.cache_size += 1;
+
+                    // grow the cache if the load factor is too high
+                    if self.cache_size > self.threshold {
+                        self.grow_cache();
+                    }
+
+                    return pidx;
+                } 
+                
+                // key found, returnn index.
+                if entry.0 == key {
+                    return entry.1 as usize;
+                }
+
+                // advance to next open spot.
+                index = (index + 1) & self.cache_bits as usize;
             }
-            old_voxel
-        }
+        }  
     }
 
-    #[inline(always)]
-    fn search_cache(&mut self, val: u16) -> usize {
-        unsafe { self.cache.as_mut() }.search(val)
-            .unwrap_or_else(|i| self.find_or_insert(val, i))
+    /// Double the cache size.
+    #[inline(never)]
+    fn grow_cache(&mut self) {
+        // compute new/old size
+        let old_size = (self.cache_bits + 1) as usize;
+        let new_size = old_size << 1;
+        let new_bits = new_size - 1;
+
+        // allocate new pointer
+        let old_cache = self.cache;
+        let new_cache = unsafe {
+            let new_layout = Layout::array::<(u16, u16)>(new_size).unwrap();
+            let ptr = self.alloc.allocate(new_layout).unwrap().as_non_null_ptr().cast::<_>();
+            // initialize items to (0, MAX)
+            for i in 0..new_size {
+                ptr.add(i).write((0, u16::MAX));
+            }
+            ptr
+        };
+
+        // insert old values into new ptr
+        for i in 0..old_size {
+            unsafe {
+                let item = *old_cache.add(i).as_ptr();
+                if item.1 != u16::MAX {
+                    let mut index = (item.0 ^ self.random) as usize & new_bits;
+                    while new_cache.add(index).as_ref().1 != u16::MAX {
+                        index = (index + 1) & new_bits;
+                    }
+                    *new_cache.add(index).as_mut() = (item.0, item.1);
+                }
+            }
+        }
+
+        // deallocate old ptr
+        unsafe { 
+            let old_layout = Layout::array::<(u16, u16)>(old_size).unwrap();
+            self.alloc.deallocate(old_cache.cast::<u8>(), old_layout);
+        }
+
+        // assign new pointer and params
+        self.cache = new_cache;
+        self.cache_bits = new_bits as u16;
+        self.threshold = (new_size - (new_size >> 2)) as u16; // load factor of 75%
     }
 
     #[inline(never)]
-    fn find_or_insert(&mut self, key: u16, cache_idx: usize) -> usize {
+    fn find_or_insert_in_palette(&mut self, key: u16) -> usize {
         unsafe {
-            if !self.cache_is_init() {
-                let layout = Layout::new::<Cache>();
-                let mut ptr = self.alloc.allocate(layout).unwrap().as_non_null_ptr().cast::<Cache>();
-                ptr.write(Cache::EMPTY);
-                ptr.as_mut().is_init = true;
-                self.cache = ptr;
+            // initialize cache if empty
+            if self.cache_size == 0 {
+                let layout = Layout::array::<(u16, u16)>(16).unwrap();
+                self.cache = self.alloc.allocate(layout)
+                    .unwrap().as_non_null_ptr().cast::<(u16, u16)>();
+                for i in 0..16 {
+                    self.cache.add(i).write((0, u16::MAX));
+                }
             }
 
             let mut i = 0;
 
             // SIMD search is faster than linear search when there are more than 128 keys.
-            // this is especially true on AVX512. 
+            // this is especially true on AVX512, but holds its own on SSE and AVX2 as well.
             if self.palette_len >= 128 {
                 const L: usize = SIMD_LANES / 2;
                 let tar: Simd<u16, L> = Simd::splat(key);
@@ -172,219 +252,130 @@ impl<A: Allocator> PaletteArray<A> {
                 let end = self.palette_len as usize & !(L - 1);
                 while i < end {
                     if let Some(j) = Simd::from_slice(&palette[i..]).simd_eq(tar).first_set() {
-                        let k = i + j;
-                        self.cache.as_mut().insert(key, k, cache_idx);
-                        return k;
+                        return i + j;
+                    } else {
+                        i += L;
                     }
-
-                    i += L;
                 }
             }
 
             // Either searches the entire palette with linear search, or just 
-            // the remainder of simd search. 
+            // the remainder of simd search (if any). 
             for i in i..self.palette_len as usize {
                 if *self.palette.add(i).as_ref() == key {
-                    self.cache.as_mut().insert(key, i, cache_idx);
                     return i;
                 }
             }
 
-            // allocate more space if needed
+            // search failed; grow palette / index buffer if out of space.
             if self.palette_len >= self.palette_cap {
                 self.grow_palette();
-                if self.palette_cap > self.bpi.palette_cap {
-                    self.grow_words();
-                }
             }
 
-            // assign key to palette and insert into cache
+            // Push palette key to end.
             let pidx = self.palette_len as usize;
             self.palette.add(pidx).write(key);
             self.palette_len += 1;
-            self.cache.as_mut().insert(key, pidx, cache_idx);
             pidx
         }
     }
 
-    /// Double the capacity of the palette.
+    /// Doubles the capacity of the palette.
+    /// If the BPI has increased, double the capacity of words.
     fn grow_palette(&mut self) {
-        match self.palette_cap {
-            // initialize
-            1 => {
-                self.palette_cap = 16;
-                self.palette = unsafe {
-                    let layout = Layout::array::<u16>(16).unwrap();
-                    let ptr = self.alloc.allocate(layout).unwrap().as_non_null_ptr().cast::<u16>();
-                    ptr.write(0);
-                    ptr
-                };
-            },
-            // 16 grows directly to 128
-            16 => {
-                self.palette_cap = 128;
-                self.palette = unsafe {
-                    let old_layout = Layout::array::<u16>(16).unwrap();
-                    let new_layout = Layout::array::<u16>(128).unwrap();
-                    self.alloc.grow(self.palette.cast::<u8>(), old_layout, new_layout)
-                        .unwrap().as_non_null_ptr().cast::<u16>()
-                };
-            },
-            _ => {
-                let old_cap = self.palette_cap;
-                self.palette_cap <<= 1;
-                self.palette = unsafe {
-                    let old_layout = Layout::array::<u16>(old_cap as usize).unwrap();
-                    let new_layout = Layout::array::<u16>(self.palette_cap as usize).unwrap();
-                    self.alloc.grow(self.palette.cast::<u8>(), old_layout, new_layout)
-                        .unwrap().as_non_null_ptr().cast::<u16>()
-                }
-            }
+        if self.palette_cap == 1 {
+            // Initialize palette with cap 16
+            self.palette_cap = 16;
+            self.palette = unsafe {
+                let layout = Layout::array::<u16>(16).unwrap();
+                let ptr = self.alloc.allocate(layout).unwrap().as_non_null_ptr().cast::<u16>();
+                ptr.write(0);
+                ptr
+            };
+        } else {
+            // Palette already initialized; reallocate to double the current cap.
+            let old_cap = self.palette_cap as usize;
+            let new_cap = old_cap << 1;
+            let old_layout = Layout::array::<u16>(old_cap).unwrap();
+            let new_layout = Layout::array::<u16>(new_cap).unwrap();
+            self.palette_cap = new_cap as u32;
+            self.palette = unsafe {
+                self.alloc.grow(self.palette.cast::<u8>(), old_layout, new_layout)
+                    .unwrap().as_non_null_ptr().cast::<u16>()
+            };
         }
-    }
 
-    /// Double the capacity of words, or initialize.
-    fn grow_words(&mut self) {
-        let old_bpi = self.bpi;
-        let new_bpi = old_bpi.next();
-        match old_bpi.bpi_mask.count_ones() {
-            0 => {
-                // allocate new words.
-                // We don't de-allocate the old words because it points to a static.
+        if self.palette_cap > self.bpi.palette_cap {
+            let old_bpi = self.bpi;
+            let new_bpi = self.bpi.next();
+
+            // initialize or allocate and expand
+            if old_bpi.bpi_mask == 0 {
+                // Initialize index buffer with zeroes
+                self.words = self.alloc.allocate_zeroed(new_bpi.layout())
+                    .unwrap().as_non_null_ptr().cast::<usize>();
+            } else {
+                // double capacity of words pointer
                 self.words = unsafe {
-                    let layout = Layout::array::<usize>(new_bpi.words_len as usize).unwrap();
-                    let ptr = self.alloc.allocate_zeroed(layout).unwrap().as_non_null_ptr().cast::<usize>();
-                    ptr.write_bytes(0, new_bpi.words_len as usize); // < wtf? spent like 2 hours on this
-                    ptr
+                    self.alloc.grow(self.words.cast::<u8>(), old_bpi.layout(), new_bpi.layout())
+                        .unwrap().as_non_null_ptr().cast::<usize>()
                 };
-            },
-            4 => self.expand_word_bits::<4, 8>(&old_bpi, &new_bpi),
-            8 => self.expand_word_bits::<8, 16>(&old_bpi, &new_bpi),
-            _ => panic!("[PA339] Index Buffer Overflow."),
-        }
-        self.bpi = new_bpi;
-    }
 
-    fn expand_word_bits<
-        const OLD_BPI: usize,
-        const NEW_BPI: usize,
-    >(&mut self, old_bpi: &Bpi, new_bpi: &Bpi) {
-        let bpi_mask = (1 << OLD_BPI) - 1;
-        const HALF: usize = usize::BITS as usize / 2;
-        // reallocate words pointer
-        self.words = unsafe {
-            let old_layout = Layout::array::<usize>(old_bpi.words_len as usize).unwrap();
-            let new_layout = Layout::array::<usize>(new_bpi.words_len as usize).unwrap();
-            self.alloc.grow(self.words.cast::<u8>(), old_layout, new_layout).unwrap().as_non_null_ptr().cast::<usize>()
-        };
-        // perform bit expansion
-        for i in (0..old_bpi.words_len as usize).rev() {
-            let word = unsafe { *self.words.add(i).as_ptr() };
-            let mut lower = word & const { (1 << HALF) - 1 };
-            let mut upper = word >> HALF;
-            let (mut r1, mut r2) = (0, 0);
-            let mut mask = bpi_mask;
-            for _ in 0..const { usize::BITS as usize / NEW_BPI } {
-                r1 |= lower & mask;
-                r2 |= upper & mask;
-                lower <<= OLD_BPI;
-                upper <<= OLD_BPI;
-                mask <<= NEW_BPI;
-            }
-            let k = i << 1;
-            unsafe {
-                #[cfg(test)]
-                assert!(k+1 < new_bpi.words_len as usize);
-                *self.words.add(k).as_mut() = r1;
-                *self.words.add(k+1).as_mut() = r2;
-            }
-        }
-    }
+                /// Expands the bpi from OLD to OLD*2
+                /// Only intended to be used with OLD=4 and OLD=8. Anything else is invalid.
+                /// Returns the (lower, upper) value.
+                #[inline(always)]
+                fn expand_bpi<const OLD: usize>(word: usize) -> (usize, usize) {
+                    const HALF: usize = usize::BITS as usize / 2;
 
-    /// Enumerate the indices of the array.
-    /// This function is roughly twice as fast as iterating with `PaletteArray::get`.
-    pub fn for_each<F>(&self, mut f: F) 
-    where
-        F: FnMut(usize, u16)
-    {
-        #[inline]
-        fn iter_with_bpi<const BPI: u32, A: Allocator>(pal: &PaletteArray<A>, mut f: impl FnMut(usize, u16)) {
-            unsafe {
-                let mut i = 0;
-                for j in 0..pal.bpi.words_len as usize {
-                    let mut w = *pal.words.add(j).as_ref();
-                    for _ in 0..const { usize::BITS / BPI } {
-                        (f)(i, *pal.palette.add(w & const { (1 << BPI) - 1 }).as_ref());
-                        w >>= BPI; i += 1;
+                    // Extract the lower/upper 32 bits
+                    let mut lower = word & const { (1 << HALF) - 1 };
+                    let mut upper = word >> HALF;
+
+                    // lower/upper output variables
+                    let (mut r1, mut r2) = (0, 0);
+
+                    // sliding window for selecting only relevant bits from lower/upper
+                    let mut mask = const { (1 << OLD) - 1 };
+
+                    // execute expansion from old to new into r1/r2
+                    for _ in 0..const { usize::BITS as usize / (OLD * 2) } {
+                        r1 |= lower & mask;
+                        r2 |= upper & mask;
+                        lower <<= OLD;
+                        upper <<= OLD;
+                        mask <<= const { OLD * 2 };
                     }
+
+                    (r1, r2)
                 }
-            }
-        }
 
-        match self.bpi.bpi_mask.count_ones() {
-            0 => {
-                for i in 0..SUBCHUNK_LENGTH {
-                    (f)(i, 0)
-                }
-            },
-            4 => iter_with_bpi::<4, A>(self, f),
-            8 => iter_with_bpi::<8, A>(self, f),
-            16 => iter_with_bpi::<16, A>(self, f),
-            _ => unreachable!()
-        }
-    }
-
-    pub fn from_fn<F>(alloc: A, mut f: F) -> Self 
-    where
-        F: FnMut(usize) -> u16
-    {
-        let mut i = 0;
-        let mut val = (f)(i);
-        let mut ret = Self::empty(alloc);
-
-        while val == 0 {
-            i += 1;
-            if i >= SUBCHUNK_LENGTH { return ret };
-            val = (f)(i);
-        }
-
-        loop {
-            ret.grow_words();
-            let bpi = *ret.bpi;
-            while let Some(j) = ret.find_or_insert_non_grow(val) {
-                unsafe {
-                    let w = ret.words.add(i >> bpi.ipu_div).as_mut();
-                    *w |= j << bpi.offsets[i & bpi.ipu_mod];
-                    i += 1;
-                    if i >= SUBCHUNK_LENGTH { return ret; }
-                    val = (f)(i);
-                }
-            }
-        }
-    }   
-
-    /// Linear search the palette directly without the cache, returning
-    /// None if a palette fault occurrs. Will still grow the palette if
-    /// possible.
-    fn find_or_insert_non_grow(&mut self, key: u16) -> Option<usize> {
-        unsafe {
-            let slice = std::slice::from_raw_parts(self.palette.as_ptr(), self.palette_len as usize);
-            for (i, k) in slice.iter().enumerate() {
-                if *k == key {
-                    return Some(i)
+                if old_bpi.bpi_mask == 0xF {
+                    // expand from BPI=4 to BPI=8
+                    for i in (0..Bpi::BPI4.words_len as usize).rev() {
+                        let k = i << 1;
+                        unsafe {
+                            let (lo, hi) = expand_bpi::<4>(*self.words.add(i).as_ptr());
+                            *self.words.add(k).as_mut() = lo;
+                            *self.words.add(k+1).as_mut() = hi;                            
+                        }
+                    }
+                } else if old_bpi.bpi_mask == 0xFF {
+                    // expand from BPI=8 to BPI=16
+                    for i in (0..Bpi::BPI8.words_len as usize).rev() {
+                        let k = i << 1;
+                        unsafe {
+                            let (lo, hi) = expand_bpi::<8>(*self.words.add(i).as_ptr());
+                            *self.words.add(k).as_mut() = lo;
+                            *self.words.add(k+1).as_mut() = hi;                            
+                        }
+                    }
+                } else {
+                    unreachable!("Index Buffer Overflow");
                 }
             }
 
-            if self.palette_len == self.palette_cap {
-                self.grow_palette();
-                if self.palette_cap > self.bpi.palette_cap {
-                    return None
-                }
-            }
-
-            let i = self.palette_len as usize;
-            self.palette.add(i).write(key);
-            Some(i)
+            self.bpi = new_bpi;
         }
     }
 }
@@ -399,11 +390,12 @@ impl<A: Allocator> Drop for PaletteArray<A> {
                 // deallocate words
                 let layout = Layout::array::<usize>(self.bpi.words_len as usize).unwrap();
                 self.alloc.deallocate(self.words.cast::<u8>(), layout);
-                // deallocate cache if init
-                if self.cache_is_init() {
-                    let layout = Layout::new::<Cache>();
-                    self.alloc.deallocate(self.cache.cast::<u8>(), layout);
-                }
+            }
+
+            if self.cache_size != 0 {
+                // deallocate cache
+                let layout = Layout::array::<(u16, u16)>((self.cache_bits + 1) as usize).unwrap();
+                self.alloc.deallocate(self.cache.cast::<u8>(), layout);
             }
         }
     }
@@ -451,11 +443,15 @@ impl Bpi {
         Self {
             ipu_div: ipu.trailing_zeros(),
             ipu_mod: ipu - 1,
-            words_len: (SUBCHUNK_LENGTH / ipu) as u32,
+            words_len: (crate::consts::SUBCHUNK_LENGTH / ipu) as u32,
             bpi_mask: (1 << BPI) - 1,
             offsets,
             palette_cap: u32::pow(2, BPI as u32),
         }
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::array::<usize>(self.words_len as usize).unwrap()
     }
 
     const BPI4: Self = Self::new::<4>();
@@ -471,113 +467,45 @@ impl Bpi {
     };
 }
 
-struct Cache {
-    len: usize,
-    buckets: u16x16,
-    items: [(u16, u16); 128],
-    is_init: bool,
+std::thread_local! {
+    static STATE: OnceCell<RefCell<u32>> = OnceCell::new();
 }
 
-impl Cache {
-    const EMPTY: Self = {
-        let mut result = [(u16::MAX, u16::MAX); 128];
-        result[0] = (0, 0);
-        Self {
-            buckets: u16x16::splat(u16::MAX),
-            items: result,
-            len: 1,
-            is_init: false,
-        }
-    };
-
-    fn insert(&mut self, key: u16, palette_idx: usize, cache_idx: usize) {
-        if cache_idx >= 127 {
-            self.items[127] = (key, palette_idx as u16);
-            self.buckets[15] = key;
-            self.len = 128;
-        } else {
-            self.len = (self.len+1).min(128);
-
-            // shift elements over
-            for i in ((cache_idx+1)..self.len).rev() {
-                self.items[i] = self.items[i-1];
-            }
-
-            // assign new item
-            self.items[cache_idx] = (key, palette_idx as u16);
-
-            // update buckets in shifted range
-            for i in (cache_idx >> 3)..(self.len >> 3) {
-                self.buckets[i] = self.items[((i+1) << 3) - 1].0;
-            }
-        }
-    }
-
-    /// Binary search the cache.
-    /// If `Ok` is returned, it is an index in the palette.
-    /// If `Err` is returned, it is the index in the cache the key could be inserted.
-    #[inline(always)]
-    fn search(&self, key: u16) -> Result<usize, usize> {
-        // get the index of the containing bucket
-        let mask = u16x16::splat(key).simd_le(self.buckets).to_bitmask();
-        if mask == 0 { return Err(128); }
-        let mut idx = (mask.trailing_zeros() as usize) << 3;
-        let mut mid = idx + 4;
-        // binary search the bucket (width=8)
-        idx = hint::select_unpredictable(key >= self.items[mid].0, mid, idx);
-        mid = idx + 2;
-        idx = hint::select_unpredictable(key >= self.items[mid].0, mid, idx);
-        mid = idx + 1;
-        idx = hint::select_unpredictable(key >= self.items[mid].0, mid, idx);
-        // check whether the result is eq
-        let item = self.items[idx];
-        let cmp = item.0.cmp(&key);
-        if cmp == Ordering::Equal {
-            Ok(item.1 as usize)
-        } else {
-            Err(idx + (cmp == Ordering::Less) as usize)
-        }
-    }
+fn init_random_state() -> u16 {
+    STATE.with(|cell| {
+        cell.get_or_init(move || {
+            let state = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(3753857837));
+            RefCell::new((state.as_nanos() & 0xFFFFFFFF) as u32)
+        }).replace_with(|state| {
+            let r = state.wrapping_mul(3094417873);
+            (r >> 16) ^ r
+        }) & 0xFFFF
+    }) as u16
 }
 
 #[cfg(test)]
 mod tests {
-
-    use crate::{region::PaletteArray, tests::TestRng};
-
-    use super::Cache;
-
-    #[test]
-    fn cache_search() {
-        let mut cache = Cache::EMPTY;
-        cache.is_init = true;
-
-        cache.insert(3, 9, cache.search(3).unwrap_err());
-        cache.insert(2, 11, cache.search(2).unwrap_err());
-        cache.insert(1, 15, cache.search(1).unwrap_err());
-
-        assert_eq!(cache.search(0), Ok(0));
-        assert_eq!(cache.search(1), Ok(15));
-        assert_eq!(cache.search(2), Ok(11));
-        assert_eq!(cache.search(3), Ok(9));
-        assert_eq!(cache.search(4), Err(4));
-    }
+    use super::PaletteArray;
+    use crate::tests::TestRng;
 
     #[test]
     fn palette_random() {
         let mut arr = PaletteArray::empty(std::alloc::Global);
         let mut rng = TestRng::new(0x3738787387391);
-
         let mut nums = Vec::new();
+
+        for i in 0..32768 {
+            assert_eq!(unsafe { arr.set(i, (i & 7) as u16) }, 0);
+        }
 
         for i in 0..32768 {
             let r = (rng.next() & 511) as u16;
             nums.push(r);
-            arr.set(i, r);
+            assert_eq!(unsafe { arr.set(i, r) }, (i & 7) as u16);
         }
 
         for i in 0..32768 {
-            assert_eq!(arr.get(i), nums[i]);
+            assert_eq!(unsafe { arr.get(i) }, nums[i]);
         }
     }
 }

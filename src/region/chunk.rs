@@ -93,7 +93,7 @@ impl Chunk {
         let oy = y >> SUBCHUNK_WIDTH_SHF;
         (oy >= 0 && oy < self.len as i32).then(|| {
             let j = super::to_voxel_index_wrapping(pos.with_y(y));
-            Voxel(unsafe { self.palettes.add((oy as usize) << CHUNKS_PER_REGION_SHF).as_mut().replace(j, voxel.0) })
+            Voxel(unsafe { self.palettes.add((oy as usize) << CHUNKS_PER_REGION_SHF).as_mut().set(j, voxel.0) })
         })
     }
 
@@ -188,7 +188,7 @@ impl<'s> SubchunkMut<'s> {
     pub fn set_voxel(&mut self, pos: IVec3, voxel: Voxel) -> Voxel {
         let y = pos.y - self.region.min().y;
         let j = super::to_voxel_index_wrapping(pos.with_y(y));
-        Voxel(unsafe { self.region.palettes.add(self.index).as_mut().replace(j, voxel.0) })
+        Voxel(unsafe { self.region.palettes.add(self.index).as_mut().set(j, voxel.0) })
     }
 
     pub fn get_light(&self, pos: IVec3) -> Light {

@@ -23,15 +23,18 @@ fn benchmarks(c: &mut Criterion) {
     let mut palette = PaletteArray::with_palette_capacity(256, std::alloc::Global);
     let mut rng = Rng(0x3787378357835738);
     let vals = (0..128).map(|_| (rng.next() & 127) as u16).collect::<Vec<u16>>();
-    
+    for i in 0..32768 {
+        unsafe { palette.set(i, vals[i & 127]) };
+    }
+
     c.bench_function("palette-set", |b| b.iter(|| {
         for i in black_box(0..32768) {
-            black_box(palette.replace(i, vals[i & 127]));
+            black_box(unsafe { palette.set(i, vals[i & 127]) });
         }
     }))
     .bench_function("palette-get", |b| b.iter(|| {
         for i in black_box(0..32768) {
-            black_box(palette.get(i));
+            black_box(unsafe { palette.get(i) });
         }
     }));
 }
