@@ -8,6 +8,7 @@ static mut BPI_ZERO_WORD: usize = 0;
 static mut BPI_ZERO_PALETTE: u16 = 0;
 static mut EMPTY_CACHE: [(u16, u16); 16] = [(u16::MAX, u16::MAX); 16];
 
+#[repr(align(64))]
 pub struct PaletteArray<A: Allocator=Global> {
     /// Storage for indices of voxel states in the palette.
     /// These indices are "packed" according to the bpi, to 
@@ -19,8 +20,8 @@ pub struct PaletteArray<A: Allocator=Global> {
     /// would invalidate any indices that point to that element.
     /// The first entry in the palette is always 0. 
     palette: NonNull<u16>,
-    palette_len: u32,
-    palette_cap: u32,
+    palette_len: u16,
+    palette_cap: u16,
 
     /// Hashmap of Voxel states for fast lookup.
     /// The items in cache are voxel keys to palette indices.
@@ -37,15 +38,18 @@ pub struct PaletteArray<A: Allocator=Global> {
     threshold: u16,
     random: u16,
 
-    /// Parameters that aid in index extraction/assignment 
-    /// of indices. BPI is short for "bits-per-index". 
+    /// Parameters that aid in index extraction/assignment.
+    /// BPI is short for "bits-per-index". 
     /// IPU is short for "indices-per-usize" (or per word).
     /// 
     /// The BPI is based on the length of the Palette. 
     /// For example, if the length of the palette is 256, 
     /// the bpi is 8, because 8 bits are needed to store 
     /// an index in the palette. 
-    bpi: Bpi,
+    ipu_div: u16,
+    bpi_mul: u16,
+    ipu_mod: usize,
+    bpi_mask: usize,
 
     /// Allocator used for the pointers. Right now
     /// this is the Global Allocator, but in the future
@@ -74,7 +78,10 @@ impl<A: Allocator> PaletteArray<A> {
                 cache_bits: 0b1111,
                 threshold: 11, 
                 random: init_random_state(),
-                bpi: Bpi::BPI0,
+                bpi_mul: Bpi::BPI0.bpi_mul,
+                ipu_div: Bpi::BPI0.ipu_div,
+                ipu_mod: Bpi::BPI0.ipu_mod,
+                bpi_mask: Bpi::BPI0.bpi_mask,
                 alloc,
             }
         }
@@ -96,7 +103,8 @@ impl<A: Allocator> PaletteArray<A> {
             };
             
             let words = {
-                alloc.allocate_zeroed(bpi.layout()).unwrap().as_non_null_ptr().cast::<usize>()
+                let layout = Layout::array::<usize>(words_len(bpi.ipu_div)).unwrap();
+                alloc.allocate_zeroed(layout).unwrap().as_non_null_ptr().cast::<usize>()
             };
 
             #[allow(static_mut_refs)]
@@ -114,7 +122,10 @@ impl<A: Allocator> PaletteArray<A> {
                 cache_bits: 0b1111,
                 threshold: 11,
                 random: init_random_state(),
-                bpi,
+                ipu_div: bpi.ipu_div,
+                bpi_mul: bpi.bpi_mul,
+                ipu_mod: bpi.ipu_mod,
+                bpi_mask: bpi.bpi_mask,
                 alloc
             }
         }
@@ -125,9 +136,9 @@ impl<A: Allocator> PaletteArray<A> {
     pub unsafe fn get(&self, idx: usize) -> u16 {
         debug_assert!(idx < 32768, "Index out of bounds: '{idx}'");
         unsafe {
-            let offs = (idx & self.bpi.ipu_mod) << self.bpi.bpi_mul;
-            let word = *self.words.add(idx >> self.bpi.ipu_div).as_ptr();
-            let pidx = (word >> offs) & self.bpi.bpi_mask as usize;
+            let word = *self.words.add(idx >> self.ipu_div).as_ptr();
+            let offs = (idx & self.ipu_mod) << self.bpi_mul;
+            let pidx = (word >> offs) & self.bpi_mask;
             *self.palette.add(pidx).as_ptr()
         }
     }
@@ -138,12 +149,10 @@ impl<A: Allocator> PaletteArray<A> {
         debug_assert!(idx < 32768, "Index out of bounds: '{idx}'");
         unsafe {
             let pidx = self.search(val);
-            let Bpi { ipu_mod, ipu_div, bpi_mul, bpi_mask } = self.bpi;
-            let offs = (idx & ipu_mod) << bpi_mul;
-            let word = self.words.add(idx >> ipu_div).as_mut();
-            let bpi_mask = bpi_mask as usize;
-            let old = (*word >> offs) & bpi_mask;
-            *word = (*word & !(bpi_mask << offs)) | (pidx << offs);
+            let offs = (idx & self.ipu_mod) << self.bpi_mul;
+            let word = self.words.add(idx >> self.ipu_div).as_mut();
+            let old = (*word >> offs) & self.bpi_mask;
+            *word ^= (old ^ pidx) << offs;
             *self.palette.add(old).as_ptr()
         }
     }
@@ -154,6 +163,11 @@ impl<A: Allocator> PaletteArray<A> {
             let mut index = ((key ^ self.random) & self.cache_bits) as usize;
             loop {
                 let entry = *self.cache.add(index).as_ptr();
+
+                // key found, return index.
+                if entry.0 == key {
+                    return entry.1 as usize;
+                }
 
                 // An index of 65535 means the spot is unused.
                 if entry.1 == u16::MAX {
@@ -169,13 +183,8 @@ impl<A: Allocator> PaletteArray<A> {
 
                     return pidx;
                 } 
-                
-                // key found, returnn index.
-                if entry.0 == key {
-                    return entry.1 as usize;
-                }
 
-                // advance to next open spot.
+                // advance to next spot.
                 index = (index + 1) & self.cache_bits as usize;
             }
         }  
@@ -292,65 +301,84 @@ impl<A: Allocator> PaletteArray<A> {
                 ptr
             };
 
-            // initialize words and update BPI
-            self.bpi = Bpi::BPI4;
-            self.words = self.alloc.allocate_zeroed(self.bpi.layout()).unwrap().as_non_null_ptr().cast::<usize>();
+            // update bpi to 4
+            let new_bpi = Bpi::BPI4;
+            self.bpi_mul = new_bpi.bpi_mul;
+            self.ipu_div = new_bpi.ipu_div;
+            self.ipu_mod = new_bpi.ipu_mod;
+            self.bpi_mask = new_bpi.bpi_mask;
+
+            // initialize index buffer
+            let layout = Layout::array::<usize>(words_len(new_bpi.ipu_div)).unwrap();
+            self.words = self.alloc.allocate_zeroed(layout).unwrap().as_non_null_ptr().cast::<usize>();
+
+            // everything we need to do is done, return. 
             return;
-        } else {
-            // Palette already initialized; reallocate to double the current cap.
-            let old_cap = self.palette_cap as usize;
-            let new_cap = old_cap << 1;
-            let old_layout = Layout::array::<u16>(old_cap).unwrap();
-            let new_layout = Layout::array::<u16>(new_cap).unwrap();
-            self.palette_cap = new_cap as u32;
-            self.palette = unsafe {
-                self.alloc.grow(self.palette.cast::<u8>(), old_layout, new_layout)
-                    .unwrap().as_non_null_ptr().cast::<u16>()
+        } 
+
+        // Palette already initialized; reallocate to double the current cap.
+        let old_cap = self.palette_cap as usize;
+        let new_cap = old_cap << 1;
+        let old_layout = Layout::array::<u16>(old_cap).unwrap();
+        let new_layout = Layout::array::<u16>(new_cap).unwrap();
+        self.palette_cap = new_cap as u16;
+        self.palette = unsafe {
+            self.alloc.grow(self.palette.cast::<u8>(), old_layout, new_layout)
+                .unwrap().as_non_null_ptr().cast::<u16>()
+        };
+
+        // grow the index buffer is the new capacity is too large.
+        if self.palette_cap > max_palette_cap(self.bpi_mask) {
+            let old_bpi = self.bpi();
+            let new_bpi = old_bpi.next();
+
+            // double capacity of words pointer.
+            // BPI must not be 0 at this point.
+            self.words = unsafe {
+                let old_layout = Layout::array::<usize>(words_len(old_bpi.ipu_div)).unwrap();
+                let new_layout = Layout::array::<usize>(words_len(new_bpi.ipu_div)).unwrap();
+                self.alloc.grow(self.words.cast::<u8>(), old_layout, new_layout)
+                    .unwrap().as_non_null_ptr().cast::<usize>()
             };
-        }
 
-        if self.palette_cap > self.bpi.max_palette_cap() {
-            let old_bpi = self.bpi;
-            let new_bpi = self.bpi.next();
-
-            // initialize or allocate and expand
-            if old_bpi.bpi_mask == 0 {
-                // Initialize index buffer with zeroes
-                self.words = self.alloc.allocate_zeroed(new_bpi.layout())
-                    .unwrap().as_non_null_ptr().cast::<usize>();
-            } else {
-                // double capacity of words pointer
-                self.words = unsafe {
-                    self.alloc.grow(self.words.cast::<u8>(), old_bpi.layout(), new_bpi.layout())
-                        .unwrap().as_non_null_ptr().cast::<usize>()
-                };
-
-                if old_bpi.bpi_mask == 0xF {
-                    // expand from BPI=4 to BPI=8
-                    for i in (0..Bpi::BPI4.words_len()).rev() {
-                        let k = i << 1;
-                        unsafe {
-                            let (lo, hi) = expand_bpi::<4>(*self.words.add(i).as_ptr());
-                            *self.words.add(k).as_mut() = lo;
-                            *self.words.add(k+1).as_mut() = hi;                            
-                        }
+            if old_bpi.bpi_mask == 0xF {
+                // expand from BPI=4 to BPI=8
+                for i in (0..words_len(Bpi::BPI4.ipu_div)).rev() {
+                    let k = i << 1;
+                    unsafe {
+                        let (lo, hi) = expand_bpi::<4>(*self.words.add(i).as_ptr());
+                        *self.words.add(k).as_mut() = lo;
+                        *self.words.add(k+1).as_mut() = hi;                            
                     }
-                } else if old_bpi.bpi_mask == 0xFF {
-                    // expand from BPI=8 to BPI=16
-                    for i in (0..Bpi::BPI8.words_len()).rev() {
-                        let k = i << 1;
-                        unsafe {
-                            let (lo, hi) = expand_bpi::<8>(*self.words.add(i).as_ptr());
-                            *self.words.add(k).as_mut() = lo;
-                            *self.words.add(k+1).as_mut() = hi;                            
-                        }
-                    }
-                } else {
-                    unreachable!("Index Buffer Overflow");
                 }
+            } else if old_bpi.bpi_mask == 0xFF {
+                // expand from BPI=8 to BPI=16
+                for i in (0..words_len(Bpi::BPI8.ipu_div)).rev() {
+                    let k = i << 1;
+                    unsafe {
+                        let (lo, hi) = expand_bpi::<8>(*self.words.add(i).as_ptr());
+                        *self.words.add(k).as_mut() = lo;
+                        *self.words.add(k+1).as_mut() = hi;                            
+                    }
+                }
+            } else {
+                unreachable!("Index Buffer Overflow");
             }
 
-            self.bpi = new_bpi;
+            // update bpi
+            self.bpi_mul = new_bpi.bpi_mul;
+            self.ipu_div = new_bpi.ipu_div;
+            self.ipu_mod = new_bpi.ipu_mod;
+            self.bpi_mask = new_bpi.bpi_mask;
+        }
+    }
+
+    fn bpi(&self) -> Bpi {
+        Bpi {
+            ipu_div: self.ipu_div,
+            bpi_mul: self.bpi_mul,
+            ipu_mod: self.ipu_mod,
+            bpi_mask: self.bpi_mask,
         }
     }
 }
@@ -363,7 +391,8 @@ impl<A: Allocator> Drop for PaletteArray<A> {
                 let layout = Layout::array::<u16>(self.palette_cap as usize).unwrap();
                 self.alloc.deallocate(self.palette.cast::<u8>(), layout);
                 // deallocate words
-                self.alloc.deallocate(self.words.cast::<u8>(), self.bpi.layout());
+                let layout = Layout::array::<usize>(words_len(self.ipu_div)).unwrap();
+                self.alloc.deallocate(self.words.cast::<u8>(), layout);
             }
 
             if self.cache_size != 0 {
@@ -409,7 +438,7 @@ struct Bpi {
     ipu_div: u16,
     bpi_mul: u16,
     ipu_mod: usize,
-    bpi_mask: u32,
+    bpi_mask: usize,
 }
 
 impl Bpi {
@@ -449,21 +478,6 @@ impl Bpi {
         }
     }
 
-    #[inline(always)]
-    const fn max_palette_cap(&self) -> u32 {
-        self.bpi_mask + 1
-    }
-
-    #[inline(always)]
-    const fn words_len(&self) -> usize {
-        SUBCHUNK_LENGTH / (1 << self.ipu_div) as usize
-    }
-
-    #[inline(always)]
-    fn layout(&self) -> Layout {
-        Layout::array::<usize>(self.words_len()).unwrap()
-    }
-
     const BPI4: Self = Self::new::<4>();
     const BPI8: Self = Self::new::<8>();
     const BPI16: Self = Self::new::<16>();
@@ -473,6 +487,14 @@ impl Bpi {
         ipu_mod: 0,
         bpi_mask: 0,
     };
+}
+
+const fn max_palette_cap(bpi_mask: usize) -> u16 {
+    bpi_mask as u16 + 1
+}
+
+const fn words_len(ipu_div: u16) -> usize {
+    SUBCHUNK_LENGTH / (1 << ipu_div) as usize
 }
 
 std::thread_local! {

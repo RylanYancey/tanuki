@@ -19,6 +19,7 @@ impl Rng {
     }
 }
 
+
 fn benchmarks(c: &mut Criterion) {
     let mut palette = PaletteArray::with_palette_capacity(256, std::alloc::Global);
     let mut rng = Rng(0x3787378357835738);
@@ -27,14 +28,48 @@ fn benchmarks(c: &mut Criterion) {
         unsafe { palette.set(i, vals[i & 127]) };
     }
 
-    c.bench_function("palette-set", |b| b.iter(|| {
+    c.bench_function("palette-set-8", |b| bench_set::<8>(b))
+    .bench_function("palette-set-16", |b| bench_set::<16>(b))
+    .bench_function("palette-set-64", |b| bench_set::<64>(b))
+    .bench_function("palette-set-128", |b| bench_set::<128>(b))
+    .bench_function("palette-set-256", |b| bench_set::<256>(b))
+    .bench_function("palette-set-512", |b| bench_set::<512>(b))
+    .bench_function("palette-get-8", |b| bench_get::<8>(b))
+    .bench_function("palette-get-16", |b| bench_get::<16>(b))
+    .bench_function("palette-get-64", |b| bench_get::<64>(b))
+    .bench_function("palette-get-128", |b| bench_get::<128>(b))
+    .bench_function("palette-get-256", |b| bench_get::<256>(b))
+    .bench_function("palette-get-512", |b| bench_get::<512>(b));
+}
+
+/// S must be a power of 2
+fn bench_set<const S: usize>(b: &mut Bencher) {
+    let mut palette = PaletteArray::with_palette_capacity(S, std::alloc::Global);
+    let mut rng = Rng(0x375839675189);
+    let vals = (0..S).map(|_| (rng.next() % S as u64) as u16).collect::<Vec<_>>();
+    for i in 0..32768 {
+        unsafe { palette.set(i, vals[i % S]); }
+    }
+
+    b.iter(|| {
         for i in black_box(0..32768) {
-            black_box(unsafe { palette.set(i, vals[i & 127]) });
+            let j = i ^ 0x5555;
+            black_box(unsafe { palette.set(j, vals[j & (S - 1)])});
         }
-    }))
-    .bench_function("palette-get", |b| b.iter(|| {
+    });
+}
+
+fn bench_get<const S: usize>(b: &mut Bencher) {
+    let mut palette = PaletteArray::with_palette_capacity(S, std::alloc::Global);
+    let mut rng = Rng(0x375839675189);
+    let vals = (0..S).map(|_| (rng.next() % S as u64) as u16).collect::<Vec<_>>();
+    for i in 0..32768 {
+        unsafe { palette.set(i, vals[i % S]); }
+    }
+
+    b.iter(|| {
         for i in black_box(0..32768) {
             black_box(unsafe { palette.get(i) });
         }
-    }));
+    });
 }
