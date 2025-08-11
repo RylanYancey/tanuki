@@ -39,12 +39,13 @@ pub struct PaletteArray<A: Allocator=Global> {
 
     /// Parameters that aid in index extraction/assignment 
     /// of indices. BPI is short for "bits-per-index". 
+    /// IPU is short for "indices-per-usize" (or per word).
     /// 
     /// The BPI is based on the length of the Palette. 
     /// For example, if the length of the palette is 256, 
     /// the bpi is 8, because 8 bits are needed to store 
     /// an index in the palette. 
-    bpi: &'static Bpi,
+    bpi: Bpi,
 
     /// Allocator used for the pointers. Right now
     /// this is the Global Allocator, but in the future
@@ -73,7 +74,7 @@ impl<A: Allocator> PaletteArray<A> {
                 cache_bits: 0b1111,
                 threshold: 11, 
                 random: init_random_state(),
-                bpi: &Bpi::BPI0,
+                bpi: Bpi::BPI0,
                 alloc,
             }
         }
@@ -82,7 +83,7 @@ impl<A: Allocator> PaletteArray<A> {
     pub fn with_palette_capacity(cap: usize, alloc: A) -> Self {
         debug_assert!(cap < 65536);
         let bpi = Bpi::from_palette_cap(cap);
-        if bpi.words_len == 1 {
+        if bpi.bpi_mask == 0 {
             Self::empty(alloc)
         } else {
             let mut palette_cap = cap.next_power_of_two().max(16);
@@ -95,9 +96,7 @@ impl<A: Allocator> PaletteArray<A> {
             };
             
             let words = {
-                let layout = Layout::array::<usize>(bpi.words_len as usize).unwrap();
-                let ptr = alloc.allocate_zeroed(layout).unwrap().as_non_null_ptr().cast::<usize>();
-                ptr
+                alloc.allocate_zeroed(bpi.layout()).unwrap().as_non_null_ptr().cast::<usize>()
             };
 
             #[allow(static_mut_refs)]
@@ -126,10 +125,9 @@ impl<A: Allocator> PaletteArray<A> {
     pub unsafe fn get(&self, idx: usize) -> u16 {
         debug_assert!(idx < 32768, "Index out of bounds: '{idx}'");
         unsafe {
-            let bpi = self.bpi;
-            let offs = bpi.offsets.get_unchecked(idx & bpi.ipu_mod);
-            let word = *self.words.add(idx >> bpi.ipu_div).as_ptr();
-            let pidx = (word >> offs) & bpi.bpi_mask;
+            let offs = (idx & self.bpi.ipu_mod) << self.bpi.bpi_mul;
+            let word = *self.words.add(idx >> self.bpi.ipu_div).as_ptr();
+            let pidx = (word >> offs) & self.bpi.bpi_mask as usize;
             *self.palette.add(pidx).as_ptr()
         }
     }
@@ -140,11 +138,12 @@ impl<A: Allocator> PaletteArray<A> {
         debug_assert!(idx < 32768, "Index out of bounds: '{idx}'");
         unsafe {
             let pidx = self.search(val);
-            let bpi = self.bpi;
-            let offs = bpi.offsets.get_unchecked(idx & bpi.ipu_mod);
-            let word = self.words.add(idx >> bpi.ipu_div).as_mut();
-            let old = (*word >> offs) & bpi.bpi_mask;
-            *word = (*word & !(bpi.bpi_mask << offs)) | (pidx << offs);
+            let Bpi { ipu_mod, ipu_div, bpi_mul, bpi_mask } = self.bpi;
+            let offs = (idx & ipu_mod) << bpi_mul;
+            let word = self.words.add(idx >> ipu_div).as_mut();
+            let bpi_mask = bpi_mask as usize;
+            let old = (*word >> offs) & bpi_mask;
+            *word = (*word & !(bpi_mask << offs)) | (pidx << offs);
             *self.palette.add(old).as_ptr()
         }
     }
@@ -292,6 +291,11 @@ impl<A: Allocator> PaletteArray<A> {
                 ptr.write(0);
                 ptr
             };
+
+            // initialize words and update BPI
+            self.bpi = Bpi::BPI4;
+            self.words = self.alloc.allocate_zeroed(self.bpi.layout()).unwrap().as_non_null_ptr().cast::<usize>();
+            return;
         } else {
             // Palette already initialized; reallocate to double the current cap.
             let old_cap = self.palette_cap as usize;
@@ -305,7 +309,7 @@ impl<A: Allocator> PaletteArray<A> {
             };
         }
 
-        if self.palette_cap > self.bpi.palette_cap {
+        if self.palette_cap > self.bpi.max_palette_cap() {
             let old_bpi = self.bpi;
             let new_bpi = self.bpi.next();
 
@@ -321,38 +325,9 @@ impl<A: Allocator> PaletteArray<A> {
                         .unwrap().as_non_null_ptr().cast::<usize>()
                 };
 
-                /// Expands the bpi from OLD to OLD*2
-                /// Only intended to be used with OLD=4 and OLD=8. Anything else is invalid.
-                /// Returns the (lower, upper) value.
-                #[inline(always)]
-                fn expand_bpi<const OLD: usize>(word: usize) -> (usize, usize) {
-                    const HALF: usize = usize::BITS as usize / 2;
-
-                    // Extract the lower/upper 32 bits
-                    let mut lower = word & const { (1 << HALF) - 1 };
-                    let mut upper = word >> HALF;
-
-                    // lower/upper output variables
-                    let (mut r1, mut r2) = (0, 0);
-
-                    // sliding window for selecting only relevant bits from lower/upper
-                    let mut mask = const { (1 << OLD) - 1 };
-
-                    // execute expansion from old to new into r1/r2
-                    for _ in 0..const { usize::BITS as usize / (OLD * 2) } {
-                        r1 |= lower & mask;
-                        r2 |= upper & mask;
-                        lower <<= OLD;
-                        upper <<= OLD;
-                        mask <<= const { OLD * 2 };
-                    }
-
-                    (r1, r2)
-                }
-
                 if old_bpi.bpi_mask == 0xF {
                     // expand from BPI=4 to BPI=8
-                    for i in (0..Bpi::BPI4.words_len as usize).rev() {
+                    for i in (0..Bpi::BPI4.words_len()).rev() {
                         let k = i << 1;
                         unsafe {
                             let (lo, hi) = expand_bpi::<4>(*self.words.add(i).as_ptr());
@@ -362,7 +337,7 @@ impl<A: Allocator> PaletteArray<A> {
                     }
                 } else if old_bpi.bpi_mask == 0xFF {
                     // expand from BPI=8 to BPI=16
-                    for i in (0..Bpi::BPI8.words_len as usize).rev() {
+                    for i in (0..Bpi::BPI8.words_len()).rev() {
                         let k = i << 1;
                         unsafe {
                             let (lo, hi) = expand_bpi::<8>(*self.words.add(i).as_ptr());
@@ -388,8 +363,7 @@ impl<A: Allocator> Drop for PaletteArray<A> {
                 let layout = Layout::array::<u16>(self.palette_cap as usize).unwrap();
                 self.alloc.deallocate(self.palette.cast::<u8>(), layout);
                 // deallocate words
-                let layout = Layout::array::<usize>(self.bpi.words_len as usize).unwrap();
-                self.alloc.deallocate(self.words.cast::<u8>(), layout);
+                self.alloc.deallocate(self.words.cast::<u8>(), self.bpi.layout());
             }
 
             if self.cache_size != 0 {
@@ -401,32 +375,59 @@ impl<A: Allocator> Drop for PaletteArray<A> {
     }
 }
 
+/// Expands the bpi from OLD to OLD*2
+/// Only intended to be used with OLD=4 and OLD=8. Anything else is invalid.
+/// Returns the (lower, upper) value.
+#[inline(always)]
+fn expand_bpi<const OLD: usize>(word: usize) -> (usize, usize) {
+    const HALF: usize = usize::BITS as usize / 2;
+
+    // Extract the lower/upper 32 bits
+    let mut lower = word & const { (1 << HALF) - 1 };
+    let mut upper = word >> HALF;
+
+    // lower/upper output variables
+    let (mut r1, mut r2) = (0, 0);
+
+    // sliding window for selecting only relevant bits from lower/upper
+    let mut mask = const { (1 << OLD) - 1 };
+
+    // execute expansion from old to new into r1/r2
+    for _ in 0..const { usize::BITS as usize / (OLD * 2) } {
+        r1 |= lower & mask;
+        r2 |= upper & mask;
+        lower <<= OLD;
+        upper <<= OLD;
+        mask <<= const { OLD * 2 };
+    }
+
+    (r1, r2)
+}
+
 #[derive(Debug, Copy, Clone)]
 struct Bpi {
-    ipu_div: u32,
+    ipu_div: u16,
+    bpi_mul: u16,
     ipu_mod: usize,
-    bpi_mask: usize,
-    offsets: [u8; 16],    
-    words_len: u32,
-    palette_cap: u32,
+    bpi_mask: u32,
 }
 
 impl Bpi {
-    fn next(&self) -> &'static Self {
+    fn next(&self) -> Self {
         match self.bpi_mask.count_ones() {
-            0 => &Self::BPI4,
-            4 => &Self::BPI8,
-            8 => &Self::BPI16,
-            _ => unreachable!("[PA221] Overflow.")
+            0 => Self::BPI4,
+            4 => Self::BPI8,
+            8 => Self::BPI16,
+            _ => unreachable!("Palette Overflow.")
         }
     }
 
-    const fn from_palette_cap(cap: usize) -> &'static Self {
+    const fn from_palette_cap(cap: usize) -> Self {
         match cap {
-            ..=1 => &Self::BPI0,
-            ..=16 => &Self::BPI4,
-            ..=256 => &Self::BPI8,
-            _ => &Self::BPI16,
+            ..=1 => Self::BPI0,
+            ..=16 => Self::BPI4,
+            ..=256 => Self::BPI8,
+            _ => Self::BPI16,
         }
     }
 
@@ -441,17 +442,26 @@ impl Bpi {
         }
 
         Self {
-            ipu_div: ipu.trailing_zeros(),
+            ipu_div: ipu.trailing_zeros() as u16,
+            bpi_mul: BPI.trailing_zeros() as u16,
             ipu_mod: ipu - 1,
-            words_len: (crate::consts::SUBCHUNK_LENGTH / ipu) as u32,
             bpi_mask: (1 << BPI) - 1,
-            offsets,
-            palette_cap: u32::pow(2, BPI as u32),
         }
     }
 
+    #[inline(always)]
+    const fn max_palette_cap(&self) -> u32 {
+        self.bpi_mask + 1
+    }
+
+    #[inline(always)]
+    const fn words_len(&self) -> usize {
+        SUBCHUNK_LENGTH / (1 << self.ipu_div) as usize
+    }
+
+    #[inline(always)]
     fn layout(&self) -> Layout {
-        Layout::array::<usize>(self.words_len as usize).unwrap()
+        Layout::array::<usize>(self.words_len()).unwrap()
     }
 
     const BPI4: Self = Self::new::<4>();
@@ -459,11 +469,9 @@ impl Bpi {
     const BPI16: Self = Self::new::<16>();
     const BPI0: Self = Self {
         ipu_div: 15,
+        bpi_mul: 0,
         ipu_mod: 0,
         bpi_mask: 0,
-        words_len: 1,
-        offsets: [0; 16],
-        palette_cap: 1,
     };
 }
 
