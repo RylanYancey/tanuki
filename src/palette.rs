@@ -1,12 +1,9 @@
 use std::{alloc::{Allocator, Global, Layout}, cell::{OnceCell, RefCell}, ptr::NonNull, simd::prelude::*, time::Duration};
 
-use web_time::{SystemTime, UNIX_EPOCH};
-
-use crate::consts::*;
+use crate::{consts::*, voxel::Voxel};
 
 static mut BPI_ZERO_WORD: usize = 0;
 static mut BPI_ZERO_PALETTE: u16 = 0;
-static mut EMPTY_CACHE: [(u16, u16); 16] = [(u16::MAX, u16::MAX); 16];
 
 #[repr(align(64))]
 pub struct PaletteArray<A: Allocator=Global> {
@@ -46,8 +43,8 @@ pub struct PaletteArray<A: Allocator=Global> {
     /// For example, if the length of the palette is 256, 
     /// the bpi is 8, because 8 bits are needed to store 
     /// an index in the palette. 
-    ipu_div: u16,
-    bpi_mul: u16,
+    ipu_div: u8,
+    bpi_mul: u8,
     ipu_mod: usize,
     bpi_mask: usize,
 
@@ -63,21 +60,22 @@ impl<A: Allocator> PaletteArray<A> {
     /// We're using statics here instead of `Option<NonNull<T>>`, which allows our
     /// .get()s to be branchless - this DID result in a significant performance improvement.
     /// 
-    /// As long as we don't assign to the pointers before allocating, we're fine. 
-    /// (although we do assign once, but guaranteed to only be 0 so its fine)
+    /// As long as we don't assign to the pointers before initializing, we're fine. 
+    /// We break this rule in the `words` pointer, but we only ever assign 0 so its a non-issue.
     #[allow(static_mut_refs)]
     pub fn empty(alloc: A) -> Self {
+        let random = init_random_state();
         unsafe {
             Self {
                 palette: NonNull::new_unchecked(&BPI_ZERO_PALETTE as *const _ as *mut _),
                 palette_len: 1,
                 palette_cap: 1, 
                 words: NonNull::new_unchecked(&BPI_ZERO_WORD as *const _ as *mut _),
-                cache: NonNull::new_unchecked(&EMPTY_CACHE as *const _ as *mut _),
+                cache: NonNull::new_unchecked(&EMPTY_CACHES[(random & 0xF) as usize] as *const _ as *mut _),
                 cache_size: 0,
                 cache_bits: 0b1111,
                 threshold: 11, 
-                random: init_random_state(),
+                random,
                 bpi_mul: Bpi::BPI0.bpi_mul,
                 ipu_div: Bpi::BPI0.ipu_div,
                 ipu_mod: Bpi::BPI0.ipu_mod,
@@ -107,9 +105,10 @@ impl<A: Allocator> PaletteArray<A> {
                 alloc.allocate_zeroed(layout).unwrap().as_non_null_ptr().cast::<usize>()
             };
 
+            let random = init_random_state();
             #[allow(static_mut_refs)]
             let cache = unsafe {
-                NonNull::new_unchecked(&EMPTY_CACHE as *const _ as *mut _)
+                NonNull::new_unchecked(&EMPTY_CACHES[(random & 0xF) as usize] as *const _ as *mut _)
             };
 
             Self {
@@ -119,9 +118,9 @@ impl<A: Allocator> PaletteArray<A> {
                 words,
                 cache,
                 cache_size: 0,
-                cache_bits: 0b1111,
+                cache_bits: 0xF,
                 threshold: 11,
-                random: init_random_state(),
+                random,
                 ipu_div: bpi.ipu_div,
                 bpi_mul: bpi.bpi_mul,
                 ipu_mod: bpi.ipu_mod,
@@ -143,17 +142,44 @@ impl<A: Allocator> PaletteArray<A> {
         }
     }
 
-    /// Assign to the voxel state at this index, returning the previous value.
+    /// Assign to the voxel state at this index.
     #[inline(always)]
-    pub unsafe fn set(&mut self, idx: usize, val: u16) -> u16 {
+    pub unsafe fn set(&mut self, idx: usize, val: u16) {
         debug_assert!(idx < 32768, "Index out of bounds: '{idx}'");
         unsafe {
             let pidx = self.search(val);
-            let offs = (idx & self.ipu_mod) << self.bpi_mul;
             let word = self.words.add(idx >> self.ipu_div).as_mut();
+            let offs = (idx & self.ipu_mod) << self.bpi_mul;
+            let clear = *word & !(self.bpi_mask << offs);
+            *word = clear | (pidx << offs);
+        }
+    }
+
+    /// Assign to the voxel state at this index, returning the previous value.
+    #[inline(always)]
+    pub unsafe fn replace(&mut self, idx: usize, val: u16) -> u16 {
+        debug_assert!(idx < 32768, "Index out of bounds: '{idx}'");
+        unsafe {
+            let pidx = self.search(val);
+            let word = self.words.add(idx >> self.ipu_div).as_mut();
+            let offs = (idx & self.ipu_mod) << self.bpi_mul;
             let old = (*word >> offs) & self.bpi_mask;
             *word ^= (old ^ pidx) << offs;
             *self.palette.add(old).as_ptr()
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn get_span(&self, start: usize, span: &mut [Voxel]) {
+        for i in 0..span.len() {
+            span[i] = Voxel(unsafe { self.get(start + i) })
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn set_span(&mut self, start: usize, span: &[Voxel]) {
+        for i in 0..span.len() {
+            unsafe { self.set(start + i, span[i].0) }
         }
     }
 
@@ -435,9 +461,17 @@ fn expand_bpi<const OLD: usize>(word: usize) -> (usize, usize) {
 
 #[derive(Debug, Copy, Clone)]
 struct Bpi {
-    ipu_div: u16,
-    bpi_mul: u16,
+    /// SHR Factor for dividing by the indices-per-usize
+    ipu_div: u8,
+
+    /// SHL Factor for multiplying by the bits-per-index
+    bpi_mul: u8,
+
+    /// AND Factor for modulo by the indices-per-usize
     ipu_mod: usize,
+
+    /// Mask of the first N bits. 
+    /// If BPI=4, then this is equal to 0xF.
     bpi_mask: usize,
 }
 
@@ -471,8 +505,8 @@ impl Bpi {
         }
 
         Self {
-            ipu_div: ipu.trailing_zeros() as u16,
-            bpi_mul: BPI.trailing_zeros() as u16,
+            ipu_div: ipu.trailing_zeros() as u8,
+            bpi_mul: BPI.trailing_zeros() as u8,
             ipu_mod: ipu - 1,
             bpi_mask: (1 << BPI) - 1,
         }
@@ -493,25 +527,49 @@ const fn max_palette_cap(bpi_mask: usize) -> u16 {
     bpi_mask as u16 + 1
 }
 
-const fn words_len(ipu_div: u16) -> usize {
-    SUBCHUNK_LENGTH / (1 << ipu_div) as usize
+const fn words_len(ipu_div: u8) -> usize {
+    SUBCHUNK_LENGTH / (1 << ipu_div) 
 }
 
 std::thread_local! {
     static STATE: OnceCell<RefCell<u32>> = OnceCell::new();
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn init_random_state() -> u16 {
+    use std::time::{SystemTime, UNIX_EPOCH};
     STATE.with(|cell| {
         cell.get_or_init(move || {
             let state = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(3753857837));
             RefCell::new((state.as_nanos() & 0xFFFFFFFF) as u32)
         }).replace_with(|state| {
-            let r = state.wrapping_mul(3094417873);
+            let r = state.wrapping_mul(3094417873).wrapping_add(177818209);
             (r >> 16) ^ r
         }) & 0xFFFF
     }) as u16
 }
+
+#[cfg(target_family = "wasm")]
+fn init_random_state() -> u16 {
+    STATE.with(|cell| {
+        cell.get_or_init(move || {
+            RefCell::new(2834261329)
+        }).replace_with(|state| {
+            let r = state.wrapping_mul(3094417873).wrapping_add(177818209);
+            (r >> 16) ^ r
+        }) & 0xFFFF
+    }) as u16
+}
+
+static mut EMPTY_CACHES: [[(u16, u16); 16]; 16] = {
+    let mut result = [[(u16::MAX, u16::MAX); 16]; 16];
+    let mut i = 0;
+    while i < 16 {
+        result[i][i] = (0, 0);
+        i += 1;
+    }
+    result
+};
 
 #[cfg(test)]
 mod tests {
@@ -525,13 +583,14 @@ mod tests {
         let mut nums = Vec::new();
 
         for i in 0..32768 {
-            assert_eq!(unsafe { arr.set(i, (i & 7) as u16) }, 0);
+            unsafe { arr.set(i, (i & 7) as u16) }
+            // assert_eq!(unsafe { arr.replace(i, (i & 7) as u16) }, 0);
         }
 
         for i in 0..32768 {
             let r = (rng.next() & 511) as u16;
             nums.push(r);
-            assert_eq!(unsafe { arr.set(i, r) }, (i & 7) as u16);
+            assert_eq!(unsafe { arr.replace(i, r) }, (i & 7) as u16);
         }
 
         for i in 0..32768 {

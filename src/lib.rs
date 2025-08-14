@@ -5,10 +5,15 @@
 #![feature(slice_ptr_get)]
 #![feature(box_vec_non_null)]
 
+pub mod lightmap;
+pub mod palette;
 pub mod consts;
 pub mod region;
-pub mod access;
+pub mod alloc;
+pub mod chunk;
+pub mod voxel;
 pub mod world;
+pub mod map;
 
 #[cfg(test)]
 mod tests {

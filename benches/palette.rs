@@ -4,7 +4,7 @@
 use criterion::*;
 criterion::criterion_group!(benches, benchmarks);
 criterion::criterion_main!(benches);
-use tanuki::region::PaletteArray;
+use tanuki::palette::PaletteArray;
 use std::hint::black_box;
 
 struct Rng(u64);
@@ -34,11 +34,6 @@ fn benchmarks(c: &mut Criterion) {
     .bench_function("palette-set-128", |b| bench_set::<128>(b))
     .bench_function("palette-set-256", |b| bench_set::<256>(b))
     .bench_function("palette-set-512", |b| bench_set::<512>(b))
-    .bench_function("palette-get-8", |b| bench_get::<8>(b))
-    .bench_function("palette-get-16", |b| bench_get::<16>(b))
-    .bench_function("palette-get-64", |b| bench_get::<64>(b))
-    .bench_function("palette-get-128", |b| bench_get::<128>(b))
-    .bench_function("palette-get-256", |b| bench_get::<256>(b))
     .bench_function("palette-get-512", |b| bench_get::<512>(b));
 }
 
@@ -53,8 +48,9 @@ fn bench_set<const S: usize>(b: &mut Bencher) {
 
     b.iter(|| {
         for i in black_box(0..32768) {
-            let j = i ^ 0x5555;
-            black_box(unsafe { palette.set(j, vals[j & (S - 1)])});
+            // scrambling for a more realistic access pattern
+            let i = ((i & 1023) << 5) | (i >> 10);
+            black_box(unsafe { palette.set(i, vals[i & (S - 1)])});
         }
     });
 }
