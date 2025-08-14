@@ -2,8 +2,6 @@
 
 use std::{alloc::{Allocator, Global, Layout}, ptr::NonNull, sync::Arc};
 
-use crate::consts::SUBCHUNK_LENGTH;
-
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct Light {
     /// 4 bits ambient intensity, 4 bits torch intensity.
@@ -31,8 +29,8 @@ impl Light {
     }
 }
 
-static LIGHTMAP_UNIFORM_FULL: [Light; SUBCHUNK_LENGTH] = [const { Light::full() }; SUBCHUNK_LENGTH];
-static LIGHTMAP_UNIFORM_NONE: [Light; SUBCHUNK_LENGTH] = [const { Light::none() }; SUBCHUNK_LENGTH];
+static LIGHTMAP_UNIFORM_FULL: [Light; 32768] = [const { Light::full() }; 32768];
+static LIGHTMAP_UNIFORM_NONE: [Light; 32768] = [const { Light::none() }; 32768];
 
 pub struct LightMap<A: Allocator = Global> {
     ptr: NonNull<Light>,
@@ -68,31 +66,31 @@ impl<A: Allocator> LightMap<A> {
     }
 
     pub fn get(&self, idx: usize) -> Option<Light> {
-        (idx < SUBCHUNK_LENGTH).then(|| unsafe { self.get_unchecked(idx) })
+        (idx < 32768).then(|| unsafe { self.get_unchecked(idx) })
     }
 
     pub unsafe fn get_unchecked(&self, idx: usize) -> Light {
         #[cfg(test)]
-        assert!(idx < SUBCHUNK_LENGTH);
+        assert!(idx < 32768);
         unsafe { *self.ptr.add(idx).as_ref() }
     }
 
     pub fn set(&mut self, idx: usize, light: Light) -> Option<Light> {
-        (idx < SUBCHUNK_LENGTH).then(|| unsafe { self.set_unchecked(idx, light) })
+        (idx < 32768).then(|| unsafe { self.set_unchecked(idx, light) })
     }
 
     pub unsafe fn set_unchecked(&mut self, idx: usize, light: Light) -> Light {
         #[cfg(test)]
-        assert!(idx < SUBCHUNK_LENGTH);
+        assert!(idx < 32768);
         unsafe {
             if self.is_uniform {
                 if light == *self.ptr.as_ptr() {
                     light
                 } else {
                     self.is_uniform = true;
-                    let layout = Layout::array::<Light>(SUBCHUNK_LENGTH).unwrap();
+                    let layout = Layout::array::<Light>(32768).unwrap();
                     let ptr = self.alloc.allocate(layout).unwrap().as_non_null_ptr().cast::<Light>();
-                    ptr.copy_from(self.ptr, SUBCHUNK_LENGTH);
+                    ptr.copy_from(self.ptr, 32768);
                     self.ptr = ptr;
                     std::mem::replace(self.ptr.add(idx).as_mut(), light)                    
                 }

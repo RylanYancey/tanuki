@@ -1,6 +1,6 @@
 use std::{alloc::{Allocator, Global, Layout}, cell::{OnceCell, RefCell}, ptr::NonNull, simd::prelude::*, time::Duration};
 
-use crate::{consts::*, voxel::Voxel};
+use crate::voxel::Voxel;
 
 static mut BPI_ZERO_WORD: usize = 0;
 static mut BPI_ZERO_PALETTE: u16 = 0;
@@ -73,7 +73,7 @@ impl<A: Allocator> PaletteArray<A> {
                 words: NonNull::new_unchecked(&BPI_ZERO_WORD as *const _ as *mut _),
                 cache: NonNull::new_unchecked(&EMPTY_CACHES[(random & 0xF) as usize] as *const _ as *mut _),
                 cache_size: 0,
-                cache_bits: 0b1111,
+                cache_bits: 0xF,
                 threshold: 11, 
                 random,
                 bpi_mul: Bpi::BPI0.bpi_mul,
@@ -280,7 +280,7 @@ impl<A: Allocator> PaletteArray<A> {
             // SIMD search is faster than linear search when there are more than 128 keys.
             // this is especially true on AVX512, but holds its own on SSE and AVX2 as well.
             if self.palette_len >= 128 {
-                const L: usize = SIMD_LANES / 2;
+                const L: usize = 8;
                 let tar: Simd<u16, L> = Simd::splat(key);
                 let palette = std::slice::from_raw_parts(self.palette.as_ptr(), self.palette_len as usize);
                 let end = self.palette_len as usize & !(L - 1);
@@ -528,7 +528,7 @@ const fn max_palette_cap(bpi_mask: usize) -> u16 {
 }
 
 const fn words_len(ipu_div: u8) -> usize {
-    SUBCHUNK_LENGTH / (1 << ipu_div) 
+    32768 / (1 << ipu_div) 
 }
 
 std::thread_local! {
